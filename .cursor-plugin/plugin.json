@@ -1,0 +1,21 @@
+{
+  "name": "roninforge-terraform",
+  "version": "1.0.0",
+  "description": "Terraform 1.9+ and OpenTofu 1.8+ rules for Cursor. Teaches for_each over count, remote backend with locking, version pinning, moved/removed/import blocks, ephemeral resources for secrets, check blocks, tftest framework, OpenTofu state encryption, OIDC federation. Catches 20 regressions including 0.0.0.0/0 ingress, count for stable resources, ignore_changes=all, null_resource overuse, plaintext secrets, unpinned providers.",
+  "author": {
+    "name": "RoninForge",
+    "url": "https://roninforge.org"
+  },
+  "homepage": "https://github.com/RoninForge/roninforge-terraform",
+  "repository": "https://github.com/RoninForge/roninforge-terraform",
+  "license": "MIT",
+  "keywords": [
+    "terraform",
+    "opentofu",
+    "hcl",
+    "infrastructure-as-code",
+    "iac",
+    "aws",
+    "anti-patterns"
+  ]
+}

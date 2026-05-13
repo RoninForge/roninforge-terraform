@@ -1,0 +1,282 @@
+---
+description: "Core Terraform / OpenTofu rules. Enforces version pinning, remote backend with locking, for_each over count, moved/removed/import blocks for safe refactoring, typed + validated variables, sensitive outputs, OIDC for CI auth. Covers Terraform 1.9+ and OpenTofu 1.8+ delta."
+alwaysApply: true
+---
+
+# Terraform / OpenTofu Core Rules
+
+You are writing **Terraform 1.9+** or **OpenTofu 1.8+**. The two languages are 95% compatible; differences are flagged explicitly. Follow these rules.
+
+## Pin Terraform/OpenTofu and provider versions
+
+Every root module declares the engine and provider versions. `terraform plan` becomes deterministic only when versions are pinned.
+
+```hcl
+terraform {
+  required_version = "~> 1.15"
+
+  required_providers {
+    aws    = { source = "hashicorp/aws",    version = "~> 5.70" }
+    random = { source = "hashicorp/random", version = "~> 3.6"  }
+  }
+}
+```
+
+`~> 5.70` accepts 5.71, 5.72 but not 6.0 (semver). Pin the engine in `required_version`, providers in `required_providers`.
+
+## Remote backend with state locking
+
+Local state is fine for personal experiments. Anything shared - team, CI, production - needs a remote backend with locking.
+
+```hcl
+# Terraform Cloud, HCP Terraform, AWS, GCP, Azure all supported
+terraform {
+  backend "s3" {
+    bucket         = "acme-tfstate"
+    key            = "prod/vpc.tfstate"
+    region         = "eu-central-1"
+    dynamodb_table = "tfstate-locks"   # state locking
+    encrypt        = true
+  }
+}
+```
+
+OpenTofu 1.7+ adds native state encryption on top of any backend:
+
+```hcl
+terraform {
+  encryption {
+    key_provider "aws_kms" "k" {
+      kms_key_id = "alias/tofu-state"
+      region     = "eu-central-1"
+    }
+    method "aes_gcm" "m" { keys = key_provider.aws_kms.k }
+    state { method = method.aes_gcm.m }
+    plan  { method = method.aes_gcm.m }
+  }
+}
+```
+
+This is OpenTofu-only. Terraform does not support encryption at the engine level; rely on backend-side encryption (S3 SSE, GCS CMEK) or HCP Terraform.
+
+## `for_each` over `count` for stable identity
+
+```hcl
+# CORRECT
+resource "aws_s3_bucket" "logs" {
+  for_each = toset(var.bucket_names)
+  bucket   = each.value
+}
+
+# WRONG - removing bucket_names[1] renumbers buckets[2..n], destroying and recreating them
+resource "aws_s3_bucket" "logs" {
+  count  = length(var.bucket_names)
+  bucket = var.bucket_names[count.index]
+}
+```
+
+`for_each` keys resources by name. Adding/removing items only affects the specific resource. `count` keys by index, so any insertion or deletion shifts every subsequent resource into a different state address. Reserve `count` for "this resource is conditional on a single boolean":
+
+```hcl
+resource "aws_s3_bucket" "audit" {
+  count  = var.audit_logging ? 1 : 0
+  bucket = "${var.env}-audit"
+}
+```
+
+## Refactor with `moved`, retire with `removed`, adopt with `import`
+
+When renaming or restructuring resources, ship a `moved` block in the same PR. Without it, Terraform sees a new resource at the new address and destroys+recreates.
+
+```hcl
+moved {
+  from = aws_iam_role.application
+  to   = aws_iam_role.app
+}
+```
+
+When deleting a resource you want to keep alive (rare, but real: pre-existing infra adopted then handed back to a parent stack), use `removed` (Terraform 1.7+, OpenTofu 1.6+):
+
+```hcl
+removed {
+  from = aws_iam_role.legacy
+  lifecycle { destroy = false }
+}
+```
+
+For adopting existing infrastructure into Terraform, use `import` blocks - not the `terraform import` CLI:
+
+```hcl
+import {
+  to = aws_s3_bucket.logs
+  id = "acme-prod-logs"
+}
+```
+
+Commit the `import` block in a PR, apply, then delete the block in a follow-up PR. The CLI's `terraform import` mutates state on one machine and leaves the next plan showing the resource as "to be created" everywhere else.
+
+## Variables: typed, described, validated
+
+```hcl
+variable "instance_type" {
+  description = "EC2 instance type for the web tier"
+  type        = string
+  default     = "t3.micro"
+
+  validation {
+    condition     = can(regex("^t3\\.", var.instance_type))
+    error_message = "instance_type must be a t3 family size"
+  }
+}
+
+variable "admin_cidrs" {
+  description = "CIDR blocks allowed to SSH"
+  type        = list(string)
+
+  validation {
+    condition     = !contains(var.admin_cidrs, "0.0.0.0/0")
+    error_message = "admin_cidrs must not include 0.0.0.0/0"
+  }
+}
+```
+
+Every variable has `type`, `description`. Constrained variables have `validation` blocks. Terraform 1.9+ allows validation conditions to reference other variables, locals, and data sources.
+
+## Outputs: minimal, typed, sensitive flagged
+
+```hcl
+output "vpc_id" {
+  description = "ID of the created VPC"
+  value       = aws_vpc.main.id
+}
+
+output "db_endpoint" {
+  description = "RDS endpoint hostname"
+  value       = aws_db_instance.main.endpoint
+  sensitive   = false
+}
+```
+
+If an output bears a secret value (password, token, key), either omit it entirely or mark `sensitive = true`. Sensitive outputs do not appear in plan/apply logs.
+
+## Secrets via ephemeral resources (Terraform 1.10+)
+
+Storing secrets in `variable` defaults or `.tfvars` files commits them to state. Ephemeral resources (Terraform 1.10+) read each phase, never written to state or plan:
+
+```hcl
+ephemeral "aws_secretsmanager_secret_version" "db" {
+  secret_id = "prod/db/password"
+}
+
+resource "aws_db_instance" "main" {
+  password = ephemeral.aws_secretsmanager_secret_version.db.secret_string
+}
+```
+
+For OpenTofu or pre-1.10 Terraform, use a `data` source on Secrets Manager / SSM Parameter Store and mark the data source `sensitive`. State will still contain the value - encrypt the state file.
+
+Terraform 1.11+ adds **write-only arguments** on managed resources: arguments accept ephemeral values but never persist to state. For `aws_db_instance.password` this completes the secrets story - the value flows through Terraform but never lands in state or plan. Check provider docs for which arguments are write-only-capable.
+
+## OIDC federation for CI auth
+
+```yaml
+# GitHub Actions
+- uses: aws-actions/configure-aws-credentials@v4
+  with:
+    role-to-assume: arn:aws:iam::123456789012:role/terraform-deploy
+    aws-region: eu-central-1
+    audience: sts.amazonaws.com
+```
+
+OIDC tokens are minted per workflow run, scoped to the repository and branch. No static AWS access keys in repo secrets or environment.
+
+## Repo layout: live envs + reusable modules
+
+```
+infra/
+  modules/
+    vpc/                 # reusable, semver-tagged
+      main.tf  variables.tf  outputs.tf  versions.tf
+    rds/
+      ...
+  live/
+    prod/eu-central-1/vpc/
+      main.tf  backend.tf  terraform.tfvars
+    staging/eu-central-1/vpc/
+    dev/eu-central-1/vpc/
+```
+
+One root module per environment+region. Cross-environment state never shared. Modules versioned via git tag or registry:
+
+```hcl
+module "vpc" {
+  source  = "git::ssh://git@github.com/acme/tf-modules.git//vpc?ref=v1.4.0"
+  # or registry
+  # source  = "acme/vpc/aws"
+  # version = "~> 1.4"
+}
+```
+
+`source = "../../../modules/vpc"` is acceptable inside a monorepo but loses semver discipline; pin to tags once a module is consumed across teams.
+
+## `check` blocks for runtime invariants (Terraform 1.5+)
+
+```hcl
+check "api_healthy" {
+  data "http" "endpoint" { url = "https://api.example.com/healthz" }
+  assert {
+    condition     = data.http.endpoint.status_code == 200
+    error_message = "api healthz returned non-200"
+  }
+}
+
+check "cost_budget" {
+  assert {
+    condition     = var.instance_count <= 10
+    error_message = "instance_count > 10 requires SRE approval"
+  }
+}
+```
+
+`check` blocks run after apply (and during plan if the data sources are pure). Failing assertions emit warnings but do not block apply - use them for advisory invariants, not gates.
+
+## Workspaces are NOT environments
+
+`terraform workspace` is for cheap parallel state (PR previews, feature branches sharing the same code). Using `terraform.workspace` interpolated into resource names produces a shared backend with cross-environment blast radius - one corrupted state takes down prod.
+
+For real environments, use separate directories (`live/prod`, `live/staging`) or separate backend keys. Workspaces are a fine-grained tool, not an environment boundary.
+
+## Pre-commit: fmt, validate, tflint, trivy
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.92.0
+    hooks:
+      - id: terraform_fmt
+      - id: terraform_validate
+      - id: terraform_tflint
+      - id: terraform_trivy
+      - id: terraform_docs
+```
+
+These run on every commit, catch formatting drift, syntax errors, security issues, and stale module docs. Mandatory in CI as well.
+
+## Provider authentication: never static keys in HCL
+
+```hcl
+# BAD
+provider "aws" {
+  access_key = var.aws_access_key
+  secret_key = var.aws_secret_key
+  region     = "eu-central-1"
+}
+
+# CORRECT - OIDC federation (CI) or shared credentials file (local)
+provider "aws" {
+  region = var.region
+}
+```
+
+The provider picks up credentials from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars, `~/.aws/credentials`, or IAM role assumption (CI). Never declare credentials in HCL.

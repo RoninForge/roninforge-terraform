@@ -1,0 +1,259 @@
+---
+description: "AWS-specific Terraform security: S3 bucket policies, IAM least-privilege, KMS encryption, RDS hardening, EC2 IMDSv2, VPC flow logs, GuardDuty, Security Hub. Catches public buckets, wildcard IAM, IMDSv1, unencrypted volumes, public DBs."
+globs: ["**/*.tf"]
+---
+
+# Terraform on AWS: Security Patterns
+
+## S3 buckets: blocked public access, encrypted, versioned
+
+```hcl
+resource "aws_s3_bucket" "logs" {
+  bucket = "${var.env}-${var.app}-logs"
+}
+
+resource "aws_s3_bucket_public_access_block" "logs" {
+  bucket                  = aws_s3_bucket.logs.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "logs" {
+  bucket = aws_s3_bucket.logs.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_key.s3.arn
+    }
+    bucket_key_enabled = true
+  }
+}
+
+resource "aws_s3_bucket_versioning" "logs" {
+  bucket = aws_s3_bucket.logs.id
+  versioning_configuration { status = "Enabled" }
+}
+```
+
+Every S3 bucket needs the public access block, server-side encryption config, and versioning. Without all three, `trivy config` will fail the build (correctly). (`tfsec` was merged into Trivy; treat them as one tool now.)
+
+## IAM: least privilege, no wildcards
+
+```hcl
+# CORRECT - narrow actions, scoped resources
+data "aws_iam_policy_document" "s3_read" {
+  statement {
+    sid     = "ReadLogsBucket"
+    effect  = "Allow"
+    actions = ["s3:GetObject", "s3:ListBucket"]
+    resources = [
+      aws_s3_bucket.logs.arn,
+      "${aws_s3_bucket.logs.arn}/*",
+    ]
+  }
+}
+
+resource "aws_iam_policy" "s3_read" {
+  name   = "${var.env}-s3-logs-read"
+  policy = data.aws_iam_policy_document.s3_read.json
+}
+```
+
+Never `actions = ["*"]` or `resources = ["*"]`. AWS Managed Policies (`AmazonS3FullAccess`) are also too broad - prefer purpose-built customer-managed policies.
+
+## RDS: private, encrypted, backed up, deletion-protected
+
+```hcl
+resource "aws_db_instance" "main" {
+  identifier             = "${var.env}-${var.app}"
+  engine                 = "postgres"
+  engine_version         = "16.4"
+  instance_class         = "db.t4g.small"
+  allocated_storage      = 20
+
+  publicly_accessible    = false                                       # never public
+  storage_encrypted      = true
+  kms_key_id             = aws_kms_key.rds.arn
+
+  backup_retention_period = 7
+  deletion_protection     = true                                       # prevents `terraform destroy` foot-gun
+  skip_final_snapshot     = false
+  final_snapshot_identifier = "${var.env}-${var.app}-final"
+
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+  vpc_security_group_ids = [aws_security_group.db.id]
+
+  password               = ephemeral.aws_secretsmanager_secret_version.db.secret_string
+  username               = "appuser"
+
+  enabled_cloudwatch_logs_exports = ["postgresql"]
+  monitoring_interval             = 60
+  monitoring_role_arn             = aws_iam_role.rds_monitoring.arn
+
+  performance_insights_enabled    = true
+  performance_insights_kms_key_id = aws_kms_key.rds.arn
+
+  tags = local.tags
+}
+```
+
+Security group for the DB allows ingress only from app security groups, never from CIDR ranges.
+
+## EC2: IMDSv2 required, encrypted root volume
+
+```hcl
+resource "aws_instance" "web" {
+  ami           = data.aws_ami.al2023.id
+  instance_type = var.instance_type
+  subnet_id     = aws_subnet.private[0].id
+
+  metadata_options {
+    http_tokens                 = "required"   # IMDSv2 only
+    http_endpoint               = "enabled"
+    http_put_response_hop_limit = 1
+    instance_metadata_tags      = "enabled"
+  }
+
+  root_block_device {
+    encrypted   = true
+    kms_key_id  = aws_kms_key.ebs.arn
+    volume_size = 20
+    volume_type = "gp3"
+  }
+
+  vpc_security_group_ids = [aws_security_group.web.id]
+  iam_instance_profile   = aws_iam_instance_profile.web.name
+
+  tags = merge(local.tags, { Name = "${var.env}-web" })
+}
+```
+
+IMDSv1 (`http_tokens = "optional"`) is the SSRF-to-credential-theft attack vector behind the Capital One breach. `required` enforces v2.
+
+## Security groups: deny by default, narrow by intent
+
+```hcl
+resource "aws_security_group" "alb" {
+  name        = "${var.env}-alb"
+  description = "Public ALB"
+  vpc_id      = aws_vpc.main.id
+
+  # only port 443 from the internet
+  ingress {
+    description = "HTTPS from internet"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]   # OK for a public ALB on 443
+  }
+
+  egress {
+    from_port        = 0
+    to_port          = 0
+    protocol         = "-1"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+  }
+
+  tags = local.tags
+}
+
+resource "aws_security_group" "app" {
+  name        = "${var.env}-app"
+  description = "App servers, ingress from ALB only"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description     = "From ALB"
+    from_port       = 8080
+    to_port         = 8080
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+
+  egress {
+    from_port        = 0
+    to_port          = 0
+    protocol         = "-1"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+  }
+}
+```
+
+App tier ingress references the ALB's security group, not a CIDR. Egress is wide because outbound is rarely the threat surface (and AWS API calls need it).
+
+## VPC flow logs, GuardDuty, Security Hub
+
+```hcl
+resource "aws_flow_log" "vpc" {
+  vpc_id          = aws_vpc.main.id
+  iam_role_arn    = aws_iam_role.flow_logs.arn
+  log_destination = aws_cloudwatch_log_group.flow_logs.arn
+  traffic_type    = "ALL"
+}
+
+resource "aws_guardduty_detector" "main" {
+  enable                       = true
+  finding_publishing_frequency = "FIFTEEN_MINUTES"
+}
+
+resource "aws_securityhub_account" "main" {}
+```
+
+Flow logs catch unexpected outbound traffic. GuardDuty catches known-bad patterns. Security Hub aggregates findings. None of them prevent incidents but they make detection possible.
+
+## KMS keys: rotation enabled, scoped policy
+
+```hcl
+resource "aws_kms_key" "data" {
+  description             = "${var.env} application data encryption"
+  enable_key_rotation     = true
+  deletion_window_in_days = 30
+  policy                  = data.aws_iam_policy_document.kms_data.json
+}
+
+resource "aws_kms_alias" "data" {
+  name          = "alias/${var.env}-data"
+  target_key_id = aws_kms_key.data.id
+}
+```
+
+Key rotation enabled. The default key policy is overly permissive - write your own that scopes `kms:Decrypt` to specific roles.
+
+## Tagging for cost + compliance
+
+```hcl
+locals {
+  tags = {
+    Environment  = var.env
+    Application  = var.app
+    Owner        = var.owner
+    CostCenter   = var.cost_center
+    ManagedBy    = "Terraform"
+    Compliance   = var.compliance  # e.g., "SOC2", "PCI"
+  }
+}
+```
+
+Apply via `provider.default_tags`:
+
+```hcl
+provider "aws" {
+  region = var.region
+  default_tags { tags = local.tags }
+}
+```
+
+Default tags apply to every taggable resource. Per-resource `tags = { Name = "..." }` merges with the defaults.
+
+## Policy-as-code in CI
+
+```bash
+trivy config .
+checkov -d .
+```
+
+Pin tool versions in the workflow. These catch the patterns in this rule file when humans miss them. A failing scan should block the PR, not warn.

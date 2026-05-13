@@ -1,0 +1,353 @@
+---
+description: "Terraform / OpenTofu anti-pattern detector. Catches 0.0.0.0/0 ingress, count for stable resources, local backend in shared modules, unpinned providers/engine, ignore_changes=all, null_resource as a hammer, terraform_remote_state for everything, lifecycle abuse, renaming without moved, CLI imports, workspaces-as-envs, secrets in HCL, unguarded RDS instances (missing backup/deletion-protection/final-snapshot), wildcard IAM, sensitive outputs without flag."
+alwaysApply: true
+---
+
+# Terraform / OpenTofu Anti-Patterns
+
+Reject these in generated HCL. Each entry has a BAD example and the CORRECT replacement.
+
+## 1. `count` for stable collections
+
+```hcl
+# BAD - removing buckets[1] renumbers buckets[2..n], destroys + recreates them
+resource "aws_s3_bucket" "logs" {
+  count  = length(var.names)
+  bucket = var.names[count.index]
+}
+
+# CORRECT
+resource "aws_s3_bucket" "logs" {
+  for_each = toset(var.names)
+  bucket   = each.value
+}
+```
+
+Reserve `count` for conditional resources (`count = var.enabled ? 1 : 0`).
+
+## 2. Local state in shared code
+
+```hcl
+# BAD - terraform.tfstate on a laptop, no locking
+terraform { required_version = ">= 1.5" }
+
+# CORRECT
+terraform {
+  required_version = "~> 1.15"
+  backend "s3" {
+    bucket         = "acme-tfstate"
+    key            = "vpc/prod.tfstate"
+    region         = "eu-central-1"
+    dynamodb_table = "tfstate-locks"
+    encrypt        = true
+  }
+}
+```
+
+## 3. Unpinned providers and engine
+
+```hcl
+# BAD - any provider version, any Terraform version
+provider "aws" { region = "eu-central-1" }
+
+# CORRECT
+terraform {
+  required_version = "~> 1.15"
+  required_providers {
+    aws = { source = "hashicorp/aws", version = "~> 5.70" }
+  }
+}
+```
+
+## 4. Renaming a resource without a `moved` block
+
+```hcl
+# BAD - rename causes destroy + create
+resource "aws_iam_role" "app" { ... }   # was "application"
+
+# CORRECT
+moved {
+  from = aws_iam_role.application
+  to   = aws_iam_role.app
+}
+```
+
+## 5. `terraform import` CLI instead of `import` block
+
+LLMs suggest `terraform import aws_instance.web i-abc`. That mutates state on one machine; the next `plan` on another machine shows the resource as "to be created". Always commit an `import` block in code, apply, then remove the block in a follow-up PR.
+
+## 6. `lifecycle { ignore_changes = all }` to hide drift
+
+```hcl
+# BAD - hides every drift forever
+lifecycle { ignore_changes = all }
+
+# CORRECT - ignore only the specific mutable fields you accept drift on
+lifecycle {
+  ignore_changes = [tags["LastScanned"], tags["LastBilled"]]
+}
+```
+
+`ignore_changes = all` turns Terraform into a write-only system - drift becomes invisible.
+
+## 7. `null_resource` + `local-exec` as a hammer
+
+```hcl
+# BAD
+resource "null_resource" "deploy" {
+  provisioner "local-exec" {
+    command = "kubectl apply -f manifest.yaml"
+  }
+}
+
+# CORRECT - use the right provider resource
+resource "kubernetes_manifest" "deploy" {
+  manifest = yamldecode(file("${path.module}/manifest.yaml"))
+}
+```
+
+`null_resource` and `terraform_data` (1.4+) are escape hatches. Reach for a real provider resource first.
+
+## 8. `0.0.0.0/0` ingress on SSH / RDP / database ports
+
+```hcl
+# BAD
+ingress {
+  from_port   = 22
+  to_port     = 22
+  protocol    = "tcp"
+  cidr_blocks = ["0.0.0.0/0"]
+}
+
+# CORRECT
+ingress {
+  from_port   = 22
+  to_port     = 22
+  protocol    = "tcp"
+  cidr_blocks = var.admin_cidrs   # validated to exclude 0.0.0.0/0
+}
+```
+
+Public ingress on management ports is the single most common Terraform-shipped vulnerability. `0.0.0.0/0` is only acceptable for ports 80/443 of a public load balancer.
+
+## 9. Secrets in `variable` defaults or `.tfvars`
+
+```hcl
+# BAD - committed to git
+variable "db_password" {
+  default = "hunter2"
+}
+
+# Also BAD - terraform.tfvars committed
+db_password = "hunter2"
+
+# CORRECT (Terraform 1.10+) - ephemeral resource
+ephemeral "aws_secretsmanager_secret_version" "db" {
+  secret_id = var.db_secret_arn
+}
+
+resource "aws_db_instance" "main" {
+  password = ephemeral.aws_secretsmanager_secret_version.db.secret_string
+}
+```
+
+Pre-1.10 Terraform / OpenTofu: use a `data` source on Secrets Manager + encrypt the state.
+
+## 10. Workspaces used as environments
+
+```hcl
+# BAD
+resource "aws_s3_bucket" "logs" {
+  bucket = "${terraform.workspace}-logs"
+}
+# All envs share the same state, the same code path, the same blast radius
+```
+
+Use separate directories or separate backend keys per environment. Workspaces are for cheap parallel state (PR previews, ephemeral testing).
+
+## 11. `depends_on` overuse
+
+```hcl
+# BAD - Terraform already detects this dependency through the reference
+resource "aws_iam_role_policy" "p" {
+  role       = aws_iam_role.r.id
+  depends_on = [aws_iam_role.r]   # redundant
+}
+
+# CORRECT - implicit dependency through aws_iam_role.r.id reference
+```
+
+`depends_on` is only needed for hidden runtime dependencies (e.g., an EC2 instance that needs an IAM policy attached before it boots; the policy attachment is not in the instance's argument list).
+
+## 12. `terraform_remote_state` for everything
+
+```hcl
+# BAD - tightly couples this module's state layout to another's
+data "terraform_remote_state" "vpc" {
+  backend = "s3"
+  config  = { ... }
+}
+resource "aws_security_group" "x" {
+  vpc_id = data.terraform_remote_state.vpc.outputs.vpc_id
+}
+
+# CORRECT - look up the VPC by tag or name with a provider data source
+data "aws_vpc" "main" {
+  tags = { Environment = var.env }
+}
+resource "aws_security_group" "x" {
+  vpc_id = data.aws_vpc.main.id
+}
+```
+
+Provider data sources query the cloud directly. Remote state ties two modules together at the state-layout level, which is brittle.
+
+## 13. Unmarked sensitive outputs
+
+```hcl
+# BAD
+output "db_password" {
+  value = aws_db_instance.main.password
+}
+
+# CORRECT
+# Do not output secrets at all; if you must:
+output "db_password" {
+  value     = aws_db_instance.main.password
+  sensitive = true
+}
+```
+
+Unmarked secret outputs appear in plan/apply logs and CI run artifacts.
+
+## 14. Static provider credentials in HCL
+
+```hcl
+# BAD
+provider "aws" {
+  access_key = var.aws_key
+  secret_key = var.aws_secret
+}
+
+# CORRECT - OIDC from CI, or shared credentials file locally
+provider "aws" {
+  region = var.region
+}
+```
+
+## 15. Wildcard IAM action / resource
+
+```hcl
+# BAD
+statement {
+  effect    = "Allow"
+  actions   = ["*"]
+  resources = ["*"]
+}
+
+# CORRECT - narrow per principle of least privilege
+statement {
+  effect    = "Allow"
+  actions   = ["s3:GetObject", "s3:PutObject"]
+  resources = [aws_s3_bucket.logs.arn, "${aws_s3_bucket.logs.arn}/*"]
+}
+```
+
+Action or resource wildcards on a resource-based or identity-based policy are flagged by every IAM auditor.
+
+## 16. Variables without `type` / `description`
+
+```hcl
+# BAD
+variable "name" {}
+
+# CORRECT
+variable "name" {
+  description = "Friendly name for the resource group"
+  type        = string
+
+  validation {
+    condition     = length(var.name) <= 64
+    error_message = "name must be 64 chars or fewer"
+  }
+}
+```
+
+`description` is consumed by `terraform-docs` and IDE tooling. `type` catches misuse at plan time. `validation` catches the rest.
+
+## 17. `dynamic` block with one literal iteration
+
+```hcl
+# BAD - dynamic block iterating over a single static element
+dynamic "ingress" {
+  for_each = [80]
+  content {
+    from_port = ingress.value
+    to_port   = ingress.value
+    ...
+  }
+}
+
+# CORRECT - just use a literal block
+ingress {
+  from_port = 80
+  to_port   = 80
+  ...
+}
+```
+
+`dynamic` is for genuinely variable-length collections of nested blocks. One literal element is noise.
+
+## 18. Module too granular or too coarse
+
+Module antipatterns:
+
+- **Too granular**: a module that wraps one resource (`aws_s3_bucket`) and exposes 20 inputs - usability suffers, callers might as well use the resource directly.
+- **Too coarse**: a single `infrastructure` module that creates VPC + RDS + Lambda + S3 + CloudFront - cannot be reused for any other shape.
+- **Leaks raw IDs**: returns `aws_s3_bucket.this.id` instead of a curated set of named outputs.
+- **Unversioned**: `source = "git::..."` with no `?ref=v1.2.3` - upstream changes silently break consumers.
+
+## 19. Public database / unencrypted volumes / IMDSv1
+
+```hcl
+# BAD
+resource "aws_db_instance" "main" {
+  publicly_accessible = true
+}
+
+resource "aws_ebs_volume" "data" {
+  encrypted = false  # or omitted, which defaults to false on some providers
+}
+
+resource "aws_instance" "web" {
+  metadata_options {
+    http_tokens = "optional"   # IMDSv1 enabled
+  }
+}
+
+# CORRECT
+resource "aws_db_instance" "main" {
+  publicly_accessible = false
+}
+resource "aws_ebs_volume" "data" {
+  encrypted = true
+}
+resource "aws_instance" "web" {
+  metadata_options {
+    http_tokens = "required"   # IMDSv2 only
+  }
+}
+```
+
+## 20. No `terraform fmt` / `validate` / `tflint` / policy scan in CI
+
+Every module merged to main should pass:
+
+```bash
+terraform fmt -check -recursive
+terraform validate
+tflint
+trivy config .   # or checkov, kics
+```
+
+Missing this is not strictly an HCL bug but lets every other anti-pattern in this file slip through.

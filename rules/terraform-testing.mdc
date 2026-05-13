@@ -1,0 +1,210 @@
+---
+description: "Terraform / OpenTofu testing: tftest framework with run blocks, mocked providers in OpenTofu 1.8+, fixture-driven examples directory, terratest for full E2E. Agent-requested - apply when writing or reviewing *.tftest.hcl files."
+---
+
+# Terraform Testing
+
+## `*.tftest.hcl` framework (Terraform 1.6+, OpenTofu 1.6+)
+
+Native test framework. Tests live alongside the module they exercise.
+
+```hcl
+# tests/vpc.tftest.hcl
+run "rejects_non_rfc1918_cidr" {
+  command = plan
+  variables {
+    name               = "test"
+    cidr_block         = "200.0.0.0/16"  # public range
+    availability_zones = ["eu-central-1a", "eu-central-1b"]
+  }
+  expect_failures = [var.cidr_block]
+}
+
+run "creates_vpc_with_valid_input" {
+  command = plan
+  variables {
+    name               = "test"
+    cidr_block         = "10.0.0.0/16"
+    availability_zones = ["eu-central-1a", "eu-central-1b"]
+  }
+  assert {
+    condition     = aws_vpc.this.cidr_block == "10.0.0.0/16"
+    error_message = "vpc cidr_block did not match input"
+  }
+  assert {
+    condition     = length(aws_subnet.private) == 2
+    error_message = "expected 2 private subnets"
+  }
+}
+
+run "applies_cleanly" {
+  command = apply
+  variables {
+    name               = "ci-${run.id}"
+    cidr_block         = "10.123.0.0/16"
+    availability_zones = ["eu-central-1a", "eu-central-1b"]
+  }
+  assert {
+    condition     = aws_vpc.this.tags["Name"] == "ci-${run.id}"
+    error_message = "Name tag not propagated"
+  }
+}
+```
+
+Run with `terraform test` (or `tofu test`). Plan-only tests run against the configured provider but never apply; apply-tests create real resources, then destroy them.
+
+## `expect_failures` for input validation
+
+```hcl
+run "rejects_zero_zero_admin_cidr" {
+  command = plan
+  variables {
+    admin_cidrs = ["0.0.0.0/0"]
+  }
+  expect_failures = [var.admin_cidrs]
+}
+```
+
+Asserts that the validation block on `var.admin_cidrs` rejects the input. Use to verify your validations are wired correctly.
+
+## Mocked providers (OpenTofu 1.8+)
+
+OpenTofu supports provider mocking in `tofu test`:
+
+```hcl
+mock_provider "aws" {
+  mock_resource "aws_s3_bucket" {
+    defaults = {
+      bucket = "mocked-bucket"
+      arn    = "arn:aws:s3:::mocked-bucket"
+    }
+  }
+}
+
+run "creates_bucket_with_mock" {
+  command   = plan
+  providers = { aws = mock_provider.aws }
+  ...
+}
+```
+
+Plan tests against a mocked provider run without real cloud credentials. Useful for fast CI feedback. Terraform does not have this feature in 1.x.
+
+Use `alias = "..."` only when you need multiple distinct mock providers (multi-region, multi-account):
+
+```hcl
+mock_provider "aws" { alias = "primary" }
+mock_provider "aws" { alias = "secondary" }
+```
+
+## Apply tests in CI
+
+Apply tests cost money and time. Strategies:
+
+- **Per-PR plan-only tests**: free, fast, catch syntax + validation + plan-shape regressions.
+- **Nightly apply test against a dedicated CI account**: catches drift in provider behavior and accidentally-broken resource configurations.
+- **Per-release apply test**: full module exercise before tagging a version.
+
+```hcl
+run "applies_in_ci" {
+  command = apply
+  variables {
+    name = "ci-test-${run.id}"     # unique per run, prevents collisions
+  }
+}
+```
+
+`run.id` is a globally unique identifier supplied by the test framework.
+
+## `examples/` directory as integration tests
+
+```
+modules/vpc/
+├── examples/
+│   ├── simple/
+│   │   ├── main.tf
+│   │   └── README.md
+│   └── multi-az/
+│       ├── main.tf
+│       └── README.md
+```
+
+Each example is a complete, apply-able config that exercises the module. In CI:
+
+```bash
+for dir in modules/vpc/examples/*/; do
+  cd "$dir"
+  terraform init
+  terraform plan
+done
+```
+
+A failing plan in any example fails the build.
+
+## Terratest for full E2E
+
+For Go-based integration tests against real cloud:
+
+```go
+package test
+
+import (
+    "testing"
+    "github.com/gruntwork-io/terratest/modules/terraform"
+    "github.com/stretchr/testify/assert"
+)
+
+func TestVpcApply(t *testing.T) {
+    t.Parallel()
+    opts := &terraform.Options{
+        TerraformDir: "../examples/simple",
+        Vars: map[string]interface{}{
+            "name": "terratest-" + randomString(),
+        },
+    }
+    defer terraform.Destroy(t, opts)
+    terraform.InitAndApply(t, opts)
+
+    vpcId := terraform.Output(t, opts, "vpc_id")
+    assert.Regexp(t, "^vpc-", vpcId)
+}
+```
+
+Terratest's strength is mid-apply assertions (call AWS SDK to verify the actual cloud state after apply, not just the Terraform state). Use it for high-value modules; plain `*.tftest.hcl` is faster for simple cases.
+
+## Policy tests with OPA / Conftest
+
+```rego
+# policies/terraform.rego
+package terraform.security
+
+deny[msg] {
+    resource := input.resource_changes[_]
+    resource.type == "aws_security_group_rule"
+    resource.change.after.cidr_blocks[_] == "0.0.0.0/0"
+    resource.change.after.from_port <= 22
+    resource.change.after.to_port >= 22
+    msg := sprintf("SSH ingress from 0.0.0.0/0 on %v", [resource.address])
+}
+```
+
+```bash
+terraform plan -out plan.tfplan
+terraform show -json plan.tfplan > plan.json
+conftest test plan.json --policy policies/
+```
+
+Pair with `trivy config` / `checkov` (which ship pre-built policy bundles; tfsec is now part of Trivy). Custom OPA policies cover org-specific rules (allowed regions, required tags, naming patterns).
+
+## What to test, what not to test
+
+Test:
+- Validation block rejects invalid inputs.
+- The right resources are created (count, type).
+- Tag merging works correctly.
+- Outputs match expected values.
+
+Don't test:
+- That AWS itself works ("an `aws_s3_bucket` actually creates an S3 bucket"). That's AWS's job.
+- Plan output for resources you have no control over (managed identities, provider-generated IDs).
+- Implementation details that change between provider versions (specific computed attributes).

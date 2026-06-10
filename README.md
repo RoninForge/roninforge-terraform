@@ -104,3 +104,12 @@ MIT - see [LICENSE](LICENSE)
 - [pre-commit-terraform](https://github.com/antonbabenko/pre-commit-terraform)
 - [Cursor Plugin Documentation](https://docs.cursor.com/plugins)
 - [RoninForge](https://roninforge.org)
+
+
+## More from RoninForge
+
+[RoninForge](https://roninforge.org) builds free tools for developers working with AI coding assistants:
+
+- [LLM API pricing comparison](https://roninforge.org/llm-pricing) - Claude, GPT, Gemini, DeepSeek, Mistral, and Grok token prices side by side, verified against official pricing pages
+- [GitHub Copilot AI Credits calculator](https://roninforge.org/copilot-credits-calculator) - estimate your monthly credit burn under usage-based billing
+- [All Cursor plugins](https://roninforge.org/#plugins)
